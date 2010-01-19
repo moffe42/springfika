@@ -6,9 +6,10 @@ error_reporting(E_ALL ^E_NOTICE);
 			
 	NTS:
 		error handling ...
+		correct handling of WantAssertionsSigned signed assertions - now only checks signature for request and response
+			need xml when checking signature after encryption ...
 		configurable NameIDFormat
 		always encrypted when json 
-		<AuthnStatement> element MAY include a <SubjectLocality> 
 		
 		metadata cleanup - representing metadata in standard xml2hash format ???
 			with a possibility for xtra params eg. filter ...
@@ -168,10 +169,18 @@ $metabase = array(
 			'filter' => 'idpfilter',
 			'publickey' => 'wayfwildcard',
 		),
-		'https://pure.wayf.ruc.dk/myWayf' => Array (
+		'http://jach-idp.test.wayf.dk/saml2/idp/metadata.php' => Array (
 			'SingleSignOnService' => array(
 				'Binding' 	=> 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect',
-				'Location' 	=> 'https://pure.wayf.ruc.dk/myWayf/saml2/idp/SSOService.php',
+				'Location' 	=> 'http://jach-idp.test.wayf.dk/saml2/idp/SSOService.php',
+			),
+			'filter' => 'idpfilter',
+			'publickey' => 'wayfwildcard',
+		),
+		'https://orphanage.wayf.dk' => Array (
+			'SingleSignOnService' => array(
+				'Binding' 	=> 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect',
+				'Location' 	=> 'https://orphanage.wayf.dk/saml2/idp/SSOService.php',
 			),
 			'filter' => 'idpfilter',
 			'publickey' => 'wayfwildcard',
@@ -188,13 +197,13 @@ foreach($metabase as $type => &$value) {
 
 define('SIGALG', 'http://www.w3.org/2000/09/xmldsig#rsa-sha1');
 define('DEBUG', 0);
-define('TRACE', 1);
+define('TRACE', 0);
 define('WAYF', $baseurl . 'wayf');
 define('DEBUGLOG', '/tmp/zzz.log');
 
 list($entitycode, $cmd) = preg_split('/[\/?]/', $_SERVER['PATH_INFO'], 0, PREG_SPLIT_NO_EMPTY);
 if (!$entitycode) $entitycode = 'main';
-if (!$cmd) $entitycode = 'demoapp';
+if (!$cmd) $cmd = 'demoapp';
 
 list($entitycode, $idp) = preg_split('/_/', $entitycode, 0, PREG_SPLIT_NO_EMPTY);
 
@@ -226,6 +235,7 @@ function prepareparams() {
 			if ($_GET[$req]) 		$message = gzinflate(base64_decode($_GET[$req]));
 			if ($message) 			$_REQUEST[$hreq] = xh::xml2hash($message);
 			if ($_GET['j'.$req]) 	$_REQUEST[$hreq] = json_decode(gzinflate(base64_decode($_GET['j'.$req])), 1);
+			if (!$_REQUEST[$hreq]) continue;
 			if ($rs = $_REQUEST['RelayState']) $_REQUEST[$hreq]['__']['RelayState'] = $rs;
 			$remotemeta = $GLOBALS['metabase']['remote'][$_REQUEST[$hreq]['saml:Issuer']['__v']];
 			$verify = ($req == 'SAMLRequest' && ($remotemeta['AuthnRequestsSigned'] || $GLOBALS['meta']['WantAuthnRequestsSigned']))
@@ -245,6 +255,8 @@ function prepareparams() {
 			}
 		}
 	}
+	if ($ea = $_REQUEST['hSAMLResponse']['saml:EncryptedAssertion']) $$_REQUEST['hSAMLResponse']['saml:Assertion'] = dodecrypt(certs::$$GLOBALS['meta']['privatekey'], $ea);
+	prepareforSLO($_REQUEST['hSAMLResponse'], 'received');
 	checkDestinationAudienceAndTiming();
 }
 
@@ -266,21 +278,18 @@ function singleSignOnService() {
 	$candidateIDPs = sizeof($scopedIDPs) > 0 ? array_intersect($scopedIDPs, $candidateIDPs) : $candidateIDPs;
 	if (sizeof($candidateIDPs) == 1) 			sendAuthnRequest($candidateIDPs[0]);
 	if (sizeof($candidateIDPs) == 0) 			sendResponse($req, createResponse($req, 'NoSupportedIDP'));
-	if ($req['_IsPassive'] == 'true') 			sendResponse($req, createResponse($req, 'NoPassive'));
 	discover($candidateIDPs); # discover should take are of IsPassive ...
 }
 
 function assertionConsumerService() {
 	$response = $_REQUEST['hSAMLResponse'];
-	if ($ea = $response['saml:EncryptedAssertion']) $response['saml:Assertion'] = dodecrypt(certs::$$GLOBALS['meta']['privatekey'], $ea);
 	infilter($response);
 	if ($GLOBALS['meta']['keepsession']) { $_SESSION['CachedResponses'][$response['saml:Issuer']['__v']] = $response; }
 	$id = $_POST['target'] ? $_POST['target'] : $response['_InResponseTo'];
 	$origRequest = $_SESSION[$_SESSION[$id]['_InResponseTo']]['hSAMLRequest'];
 	if (!$origRequest) die('No origRequest: ' . $_SESSION[$id]['_InResponseTo']);
 	unset($_SESSION[$id]['_InResponseTo']);
-	$SAMLResponse = createResponse($origRequest, null, null, $response);
-	sendResponse($origRequest, $SAMLResponse);
+	sendResponse($origRequest, createResponse($origRequest, null, null, $response));
 }
 
 function artifactResolutionService() {
@@ -322,15 +331,14 @@ function sendAuthnRequest($idp, $scope = null) {
 	$id = $_REQUEST['hSAMLRequest']['_ID'];
 	$_SESSION[$id]['hSAMLRequest'] = $_REQUEST['hSAMLRequest'];
 	$newRequest = createRequest($idp, $scope);
-	$newid = $newRequest['_ID'];
-	#$_SESSION[$newid]['hSAMLRequest'] = $newRequest;
-	$_SESSION[$newid]['_InResponseTo'] = $id;
+	$_SESSION[$newRequest['_ID']]['_InResponseTo'] = $id;
 	send($newRequest, $GLOBALS['metabase']['remote'][$idp]);
 }
 
 function sendResponse($request, $response) {
 	if ($response['samlp:Status']['samlp:StatusCode']['_Value'] == 'urn:oasis:names:tc:SAML:2.0:status:Success') {
 		outfilter($response);
+		prepareforSLO($response, 'sent');
 		send($response, $GLOBALS['metabase']['remote'][$request['saml:Issuer']['__v']]);
 		$id = $response['_ID'];
 		$_SESSION['consent'][$id]['request'] = $request;
@@ -351,8 +359,10 @@ function continue2sp() {
 }
 
 function discover($candidateIDPs) {
-	$id = $_REQUEST['hSAMLRequest']['_ID'];
-	$_SESSION[$id]['hSAMLRequest'] = $_REQUEST['hSAMLRequest'];
+	$req = $_REQUEST['hSAMLRequest'];
+	if ($req['_IsPassive'] == 'true') sendResponse($req, createResponse($req, 'NoPassive'));
+	$id = $req['_ID'];
+	$_SESSION[$id]['hSAMLRequest'] = $req;
 	$action = selfUrl() . 'continue2idp';
 	print render('discover', array('action' => $action, 'ID' => $id, 'idpList' => $candidateIDPs));
 }
@@ -891,7 +901,7 @@ function docrypt($publickey, $element, $tag = null) {
 	return $encryptedelement;
 }
 
-function dodecrypt($privatekey, $element) {
+function dodecrypt($privatekey, $element, $asXML = false) {
 	$encryptedkey = base64_decode($element['xenc:EncryptedData']['ds:KeyInfo']['xenc:EncryptedKey']['xenc:CipherData']['xenc:CipherValue']['__v']);
 	$encrypteddata = base64_decode($element['xenc:EncryptedData']['xenc:CipherData']['xenc:CipherValue']['__v']);
 
@@ -908,7 +918,33 @@ function dodecrypt($privatekey, $element) {
 	$decrypteddata = mdecrypt_generic($cipher, substr($encrypteddata, $ivsize));
 	mcrypt_generic_deinit($cipher);
 	mcrypt_module_close($cipher);	
-	return xh::xml2hash($decrypteddata);
+	return $asXML ? $decrypteddata : xh::xml2hash($decrypteddata);
+}
+
+function prepareforSLO($response, $sentorreceived) {
+	# save subject and sessionindex
+	$_SESSION['SLO'][$sentorreceived][ID()] = $response;
+};
+
+function singleLogoutService() {
+	if ($req = $_REQUEST['hSAMLRequest']) {
+		# the request is active until NotOnOrAfter
+	} elseif ($res = $_REQUEST['hSAMLResponse']) {
+		# if success
+		unset($_SESSION['SLO'][x][$_SESSION['SLOINPROCESS']][$res['_InResponseTo']]);
+	
+	} else die("What! No Kissing?");
+	foreach($_SESSION['SLO']['received'] as $id => $response ) {
+		# check for relevance for this logout request
+		$_SESSION['SLOINPROCESS'][$newid] = $id;
+		#send logout request to $response issuer ...
+		
+	}
+	foreach($_SESSION['SLO']['sent'] as $response ) {
+		
+	
+	}
+	# send logoutresponse
 }
 
 function checkDestinationAudienceAndTiming() {
